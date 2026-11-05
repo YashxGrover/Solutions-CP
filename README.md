@@ -1,2 +1,2 @@
 # Solutions-CP
-solutions of my CP journey 
+Solutions of my CP journey 
