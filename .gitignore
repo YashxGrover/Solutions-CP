@@ -69,3 +69,10 @@ Testing/
 
 # Custom Folders
 Questions/
+
+.DS_Store
+.DS_Store/
+Thumbs.db
+desktop.ini
+*.swp
+*~   
