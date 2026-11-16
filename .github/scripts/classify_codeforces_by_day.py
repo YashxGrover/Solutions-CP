@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Build a daily index of the latest accepted Codeforces solutions in this repo."""
+"""Keep the existing Codeforces folders and mirror solutions into date folders."""
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
 
 ROOT = Path(__file__).resolve().parents[2]
 CODEFORCES_DIR = ROOT / "Codeforces"
-OUTPUT = CODEFORCES_DIR / "By_Day.md"
 HANDLE = os.environ.get("CF_HANDLE", "").strip()
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 API = "https://codeforces.com/api/user.status"
+DATE_FOLDER = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def safe_problem_name(name):
+    name = re.sub(r'[<>:"/\\|?*.]', "_", name)
+    name = re.sub(r"[\s_]+", "_", name)
+    return name.strip("_. ") or "Unknown"
 
 
 def fetch_latest_accepted():
@@ -57,100 +62,102 @@ def fetch_latest_accepted():
     return accepted_by_problem
 
 
-def source_paths():
-    paths = []
-    for path in CODEFORCES_DIR.rglob("*"):
-        if not path.is_file() or path == OUTPUT or path.name == "pushed.json":
-            continue
-        paths.append(path.relative_to(CODEFORCES_DIR))
-    return paths
-
-
-def find_source(contest_id, index, paths):
-    rated_prefix = f"{contest_id}{index}_"
-    unrated_prefix = f"{index}_"
+def find_sources(contest_id, index, problem_name):
+    safe_name = safe_problem_name(problem_name)
+    rated_prefix = f"{contest_id}{index}_{safe_name}"
+    unrated_prefix = f"{index}_{safe_name}"
     matches = []
-    for rel in paths:
-        parts = rel.parts
+    for path in CODEFORCES_DIR.rglob("*"):
+        if not path.is_file() or path.name == "pushed.json":
+            continue
+        relative = path.relative_to(CODEFORCES_DIR)
+        parts = relative.parts
         if len(parts) < 2:
             continue
-        if parts[0].isdigit() and parts[-1].startswith(rated_prefix):
-            matches.append(rel)
+        is_dated = bool(DATE_FOLDER.fullmatch(parts[0]))
+        is_rated_file = path.name.startswith(rated_prefix)
+        is_unrated_file = path.name.startswith(unrated_prefix)
+        if is_dated:
+            if is_rated_file or is_unrated_file:
+                matches.append(path)
+        elif parts[0].isdigit() and is_rated_file:
+            matches.append(path)
         elif len(parts) >= 3 and parts[0] == "Contests":
-            contest_folder = parts[1]
-            if contest_folder.endswith(f"_{contest_id}") and parts[-1].startswith(unrated_prefix):
-                matches.append(rel)
-    return sorted(matches, key=lambda p: str(p))[0] if matches else None
+            if parts[1].endswith(f"_{contest_id}") and is_unrated_file:
+                matches.append(path)
+    return matches
 
 
-def link_text(submission, rel_path):
-    problem = submission.get("problem", {})
-    contest_id = submission.get("contestId") or problem.get("contestId")
-    index = problem.get("index", "?")
-    name = problem.get("name", "Unnamed problem")
-    url = f"https://codeforces.com/contest/{contest_id}/problem/{index}"
-    rel_url = quote(rel_path.as_posix(), safe="/._-()")
-    return f"[{index}. {name}]({url}) · [solution]({rel_url})"
+def submission_day(submission):
+    return datetime.fromtimestamp(
+        submission["creationTimeSeconds"], tz=timezone.utc
+    ).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+
+
+def remove_empty_date_folder(directory):
+    while directory != CODEFORCES_DIR and directory.parent != CODEFORCES_DIR:
+        if not DATE_FOLDER.fullmatch(directory.relative_to(CODEFORCES_DIR).parts[0]):
+            break
+        try:
+            directory.rmdir()
+        except OSError:
+            break
+        directory = directory.parent
 
 
 def main():
     submissions = fetch_latest_accepted()
-    paths = source_paths()
-    grouped = defaultdict(list)
+    copied = 0
+    unchanged = 0
     missing = []
 
     for (contest_id, index), submission in submissions.items():
-        rel_path = find_source(contest_id, index, paths)
-        if not rel_path:
+        problem = submission.get("problem", {})
+        matches = find_sources(contest_id, index, problem.get("name", ""))
+        if not matches:
             missing.append((contest_id, index, submission))
             continue
-        submitted_at = datetime.fromtimestamp(
-            submission["creationTimeSeconds"], tz=timezone.utc
-        ).astimezone(LOCAL_TZ)
-        grouped[submitted_at.strftime("%Y-%m-%d")].append((submitted_at, submission, rel_path))
 
-    lines = [
-        "# Codeforces solutions by submission day",
-        "",
-        f"Generated from the latest accepted submission for each problem on Codeforces handle **{HANDLE}**.",
-        "Dates use India Standard Time (IST). Existing solution files stay in their current rating or contest folders.",
-        "",
-    ]
-    if not grouped:
-        lines.extend(["_No accepted submissions with matching solution files were found._", ""])
+        legacy = [
+            path for path in matches
+            if not DATE_FOLDER.fullmatch(path.relative_to(CODEFORCES_DIR).parts[0])
+        ]
+        dated = [
+            path for path in matches
+            if DATE_FOLDER.fullmatch(path.relative_to(CODEFORCES_DIR).parts[0])
+        ]
+        # Keep the original rating/contest file as the canonical copy.
+        source = sorted(legacy or dated, key=lambda path: path.as_posix())[0]
+        destination = CODEFORCES_DIR / submission_day(submission) / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
 
-    for day in sorted(grouped, reverse=True):
-        entries = sorted(grouped[day], key=lambda item: (item[0], item[1]["id"]))
-        lines.append(f"## {day} · {len(entries)} problem{'s' if len(entries) != 1 else ''}")
-        lines.append("")
-        for submitted_at, submission, rel_path in entries:
-            stamp = submitted_at.strftime("%H:%M IST")
-            lines.append(f"- {stamp} — {link_text(submission, rel_path)}")
-        lines.append("")
+        if source != destination:
+            shutil.copy2(source, destination)
+            copied += 1
+        else:
+            unchanged += 1
 
+        # The latest accepted solution belongs under its latest accepted date only.
+        for duplicate in dated:
+            if duplicate != destination and duplicate.exists():
+                old_parent = duplicate.parent
+                duplicate.unlink()
+                remove_empty_date_folder(old_parent)
+
+    print(f"Added or refreshed {copied} date-folder copies; {unchanged} were already organized.")
+    print(f"{len(missing)} accepted problems had no matching synced source file.")
     if missing:
-        lines.extend([
-            "## Accepted submissions without a matching file",
-            "",
-            "These may appear here briefly while the separate AutoPush workflow syncs the source files.",
-            "",
-        ])
+        print("Unmatched accepted submissions (the separate AutoPush workflow may still be syncing them):")
         for contest_id, index, submission in sorted(
             missing, key=lambda item: item[2].get("creationTimeSeconds", 0), reverse=True
         ):
             problem = submission.get("problem", {})
-            submitted_at = datetime.fromtimestamp(
-                submission["creationTimeSeconds"], tz=timezone.utc
-            ).astimezone(LOCAL_TZ)
+            day = submission_day(submission)
             name = problem.get("name", "Unnamed problem")
-            lines.append(
-                f"- {submitted_at:%Y-%m-%d %H:%M IST} — "
-                f"[{index}. {name}](https://codeforces.com/contest/{contest_id}/problem/{index})"
+            print(
+                f"- {day}: {index}. {name} "
+                f"(https://codeforces.com/contest/{contest_id}/problem/{index})"
             )
-        lines.append("")
-
-    OUTPUT.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Wrote {OUTPUT.relative_to(ROOT)}: {len(submissions) - len(missing)} linked, {len(missing)} awaiting source files.")
 
 
 if __name__ == "__main__":
