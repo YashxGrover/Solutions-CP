@@ -95,9 +95,7 @@ def submission_day(submission):
 
 
 def remove_empty_date_folder(directory):
-    while directory != CODEFORCES_DIR and directory.parent != CODEFORCES_DIR:
-        if not DATE_FOLDER.fullmatch(directory.relative_to(CODEFORCES_DIR).parts[0]):
-            break
+    while directory != CODEFORCES_DIR and DATE_FOLDER.fullmatch(directory.name):
         try:
             directory.rmdir()
         except OSError:
